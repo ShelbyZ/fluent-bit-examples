@@ -1,0 +1,29 @@
+service:
+  flush: 1
+  log_level: debug
+  log_file: /output/fluent-bit.log
+
+parsers:
+  - name: json
+    format: json
+    time_key: TIMESTAMP
+    time_format: "%Y-%m-%dT%H:%M:%S.%L"
+
+pipeline:
+  inputs:
+    - name: systemd
+      path: /var/log/journal
+      systemd_filter:
+        - SYSLOG_IDENTIFIER=simple-logger
+      tag: systemd
+      read_from_tail: true
+
+  outputs:
+    - name: stdout
+      match: "*"
+      format: json_lines
+
+    - name: file
+      match: "*"
+      path: /output
+      file: file.log
