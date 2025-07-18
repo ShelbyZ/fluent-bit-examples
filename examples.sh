@@ -3,6 +3,7 @@
 # Global variable to store logger PID
 LOGGER_PID=""
 VENV_ACTIVATED=0
+USE_AWS=0
 
 # Function to clean up resources
 cleanup() {
@@ -29,19 +30,89 @@ trap cleanup SIGINT SIGTERM EXIT
 
 # Function to display usage
 usage() {
-    echo "Usage: $0 EXAMPLE_NAME"
-    echo "  EXAMPLE_NAME    Name of the example to run"
+    echo "Usage: $0 [--aws] [--image IMAGE] [--yaml|--conf] EXAMPLE_NAME"
+    echo "  EXAMPLE_NAME    Name of the example to run (basic or systemd)"
+    echo "  --aws           Use AWS Fluent Bit image and configuration (cannot be used with --image)"
+    echo "  --image IMAGE   Use custom Fluent Bit image (cannot be used with --aws)"
+    echo "  --yaml          Use YAML configuration file with custom image (default for standard image)"
+    echo "  --conf          Use CONF configuration file with custom image (default for custom and AWS images)"
     exit 1
 }
 
+# Parse command line arguments
+EXAMPLE=""
+CUSTOM_IMAGE=""
+USE_YAML=0
+USE_CONF=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --aws)
+            USE_AWS=1
+            shift
+            ;;
+        --image)
+            if [[ -z "$2" || "$2" == --* ]]; then
+                echo "Error: --image requires an argument"
+                usage
+            fi
+            CUSTOM_IMAGE="$2"
+            shift 2
+            ;;
+        --yaml)
+            USE_YAML=1
+            shift
+            ;;
+        --conf)
+            USE_CONF=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "$EXAMPLE" ]; then
+                EXAMPLE="$1"
+            else
+                echo "Error: Unexpected argument: $1"
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
+
 # Check if example name is provided
-if [ $# -eq 0 ]; then
+if [ -z "$EXAMPLE" ]; then
     echo "Error: No example name provided!"
     usage
 fi
 
-# Get example name from first argument
-EXAMPLE="$1"
+# Validate configuration options
+if [[ $USE_YAML -eq 1 && $USE_CONF -eq 1 ]]; then
+    echo "Error: Cannot use both --yaml and --conf at the same time"
+    usage
+fi
+
+# Validate that --yaml and --conf are only used with --image
+if [[ -z "$CUSTOM_IMAGE" && ($USE_YAML -eq 1 || $USE_CONF -eq 1) ]]; then
+    echo "Error: --yaml and --conf flags can only be used with --image"
+    usage
+fi
+
+# Validate that --aws is not used with --image
+if [[ ! -z "$CUSTOM_IMAGE" && $USE_AWS -eq 1 ]]; then
+    echo "Error: --aws flag cannot be used with --image"
+    usage
+fi
+
+# Set output directory based on example and flags
+OUTPUT_DIR="$EXAMPLE"
+if [ $USE_AWS -eq 1 ]; then
+    OUTPUT_DIR="${EXAMPLE}-aws"
+elif [ ! -z "$CUSTOM_IMAGE" ]; then
+    OUTPUT_DIR="${EXAMPLE}-custom"
+fi
 
 # Check if example directory exists
 if [ ! -d "./$EXAMPLE" ]; then
@@ -50,32 +121,33 @@ if [ ! -d "./$EXAMPLE" ]; then
 fi
 
 # Clean up and recreate output directory
-if [ -d "./output/$EXAMPLE" ]; then
-    echo "Cleaning output directory for example: $EXAMPLE"
-    rm -rf "./output/$EXAMPLE"
+if [ -d "./output/$OUTPUT_DIR" ]; then
+    echo "Cleaning output directory for example: $OUTPUT_DIR"
+    rm -rf "./output/$OUTPUT_DIR"
 fi
-mkdir -p "./output/$EXAMPLE"
+mkdir -p "./output/$OUTPUT_DIR"
 
 echo "Running example: $EXAMPLE"
+if [ ! -z "$CUSTOM_IMAGE" ]; then
+    echo "Using custom Fluent Bit image: $CUSTOM_IMAGE"
+elif [ $USE_AWS -eq 1 ]; then
+    echo "Using AWS Fluent Bit image and configuration"
+else
+    echo "Using standard Fluent Bit image"
+fi
 echo "Configuration from: ./$EXAMPLE"
-echo "Output to: ./output/$EXAMPLE"
+echo "Output to: ./output/$OUTPUT_DIR"
 
 # Special handling for systemd example
 if [ "$EXAMPLE" == "systemd" ]; then
     echo "Setting up systemd example with simple-logger..."
-
-    # Create temp directory if it doesn't exist
-    mkdir -p ./temp
-
     # Setup and run simple-logger in the background
     echo "Cloning simple-logger..."
-    cd ./temp
-
-    if [ ! -d "simple-logger" ]; then
-        git clone https://github.com/ShelbyZ/simple-logger.git
+    if [ -d "./temp/simple-logger" ]; then
+        rm -rf ./temp
     fi
-
-    cd simple-logger
+    git clone --single-branch --branch main https://github.com/ShelbyZ/simple-logger.git ./temp/simple-logger
+    cd ./temp/simple-logger
 
     echo "Building simple-logger..."
     # Create a virtual environment
@@ -137,10 +209,35 @@ if ! command -v docker &> /dev/null; then
 fi
 
 # Run Fluent Bit
+# Define variables based on configuration
+if [ ! -z "$CUSTOM_IMAGE" ]; then
+    # Custom image specified
+    FB_IMAGE="$CUSTOM_IMAGE"
+    
+    # Determine config file based on flags or defaults
+    if [ $USE_CONF -eq 1 ]; then
+        FB_CONFIG="fluent-bit.conf"
+    elif [ $USE_YAML -eq 1 ]; then
+        FB_CONFIG="fluent-bit.yaml"
+    else
+        # Default to conf for custom images (safer)
+        FB_CONFIG="fluent-bit.conf"
+    fi
+elif [ $USE_AWS -eq 1 ]; then
+    # AWS image
+    FB_IMAGE="amazon/aws-for-fluent-bit:latest"
+    FB_CONFIG="fluent-bit.conf"
+else
+    # Standard image
+    FB_IMAGE="fluent/fluent-bit:latest-debug"
+    FB_CONFIG="fluent-bit.yaml"
+fi
+
+# Run Docker with the defined variables
 docker run --rm \
     --privileged \
     -v "$(pwd)/$EXAMPLE:/fluent-bit/etc" \
-    -v "$(pwd)/output/$EXAMPLE:/output" \
+    -v "$(pwd)/output/$OUTPUT_DIR:/output" \
     -v /var/log/journal:/var/log/journal:ro \
-    fluent/fluent-bit:latest-debug \
-    /fluent-bit/bin/fluent-bit -c /fluent-bit/etc/fluent-bit.yaml
+    $FB_IMAGE \
+    /fluent-bit/bin/fluent-bit -c /fluent-bit/etc/$FB_CONFIG
